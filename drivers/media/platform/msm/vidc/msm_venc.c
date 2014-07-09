@@ -136,6 +136,7 @@ static const char *const mpeg_video_vidc_extradata[] = {
 	"Extradata input crop",
 	"Extradata digital zoom",
 	"Extradata aspect ratio",
+	"Extradata LTR",
 	"Extradata macroblock metadata",
 };
 
@@ -485,6 +486,26 @@ static struct msm_vidc_ctrl msm_venc_ctrls[] = {
 		.step = 1,
 		.menu_skip_mask = 0,
 		.qmenu = NULL,
+		.cluster = MSM_VENC_CTRL_CLUSTER_QP,
+	},
+	{
+		.id = V4L2_CID_MPEG_VIDC_VIDEO_VP8_MIN_QP,
+		.name = "VP8 Minimum QP",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.minimum = 1,
+		.maximum = 128,
+		.default_value = 1,
+		.step = 1,
+		.cluster = MSM_VENC_CTRL_CLUSTER_QP,
+	},
+	{
+		.id = V4L2_CID_MPEG_VIDC_VIDEO_VP8_MAX_QP,
+		.name = "VP8 Maximum QP",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.minimum = 1,
+		.maximum = 128,
+		.default_value = 128,
+		.step = 1,
 		.cluster = MSM_VENC_CTRL_CLUSTER_QP,
 	},
 	{
@@ -1778,6 +1799,26 @@ static int try_set_ctrl(struct msm_vidc_inst *inst, struct v4l2_ctrl *ctrl)
 		pdata = &qp_range;
 		break;
 	}
+	case V4L2_CID_MPEG_VIDC_VIDEO_VP8_MIN_QP: {
+		struct v4l2_ctrl *qp_max;
+		qp_max = TRY_GET_CTRL(V4L2_CID_MPEG_VIDC_VIDEO_VP8_MAX_QP);
+		property_id = HAL_PARAM_VENC_SESSION_QP_RANGE;
+		qp_range.layer_id = 0;
+		qp_range.max_qp = qp_max->val;
+		qp_range.min_qp = ctrl->val;
+		pdata = &qp_range;
+		break;
+	}
+	case V4L2_CID_MPEG_VIDC_VIDEO_VP8_MAX_QP: {
+		struct v4l2_ctrl *qp_min;
+		qp_min = TRY_GET_CTRL(V4L2_CID_MPEG_VIDC_VIDEO_VP8_MIN_QP);
+		property_id = HAL_PARAM_VENC_SESSION_QP_RANGE;
+		qp_range.layer_id = 0;
+		qp_range.max_qp = ctrl->val;
+		qp_range.min_qp = qp_min->val;
+		pdata = &qp_range;
+		break;
+	}
 	case V4L2_CID_MPEG_VIDEO_MULTI_SLICE_MODE: {
 		int temp = 0;
 
@@ -2624,6 +2665,14 @@ int msm_venc_g_fmt(struct msm_vidc_inst *inst, struct v4l2_format *f)
 			"Invalid input, inst = %p, format = %p\n", inst, f);
 		return -EINVAL;
 	}
+
+	rc = msm_comm_try_get_bufreqs(inst);
+	if (rc) {
+		dprintk(VIDC_WARN, "Getting new buffer requirements failed: %d\n",
+				rc);
+		return rc;
+	}
+
 	if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		fmt = inst->fmts[CAPTURE_PORT];
 		height = inst->prop.height[CAPTURE_PORT];

@@ -64,6 +64,8 @@ u8 pre_csc_update = 0xFF;
 
 #define MEM_PROTECT_SD_CTRL 0xF
 
+#define OVERLAY_MAX 10
+
 struct sd_ctrl_req {
 	unsigned int enable;
 } __attribute__ ((__packed__));
@@ -395,17 +397,33 @@ static int mdss_mdp_overlay_pipe_setup(struct msm_fb_data_type *mfd,
 	}
 
 	if (req->id == MSMFB_NEW_REQUEST) {
-		if (req->flags & MDP_OV_PIPE_FORCE_DMA)
-			pipe_type = MDSS_MDP_PIPE_TYPE_DMA;
-		else if (fmt->is_yuv || (req->flags & MDP_OV_PIPE_SHARE))
-			pipe_type = MDSS_MDP_PIPE_TYPE_VIG;
-		else
-			pipe_type = MDSS_MDP_PIPE_TYPE_RGB;
+		switch (req->pipe_type) {
+                case PIPE_TYPE_VIG:
+                        pipe_type = MDSS_MDP_PIPE_TYPE_VIG;
+                        break;
+                case PIPE_TYPE_RGB:
+                        pipe_type = MDSS_MDP_PIPE_TYPE_RGB;
+                        break;
+                case PIPE_TYPE_DMA:
+                        pipe_type = MDSS_MDP_PIPE_TYPE_DMA;
+                        break;
+                case PIPE_TYPE_AUTO:
+                default:
+                        if (req->flags & MDP_OV_PIPE_FORCE_DMA)
+                                pipe_type = MDSS_MDP_PIPE_TYPE_DMA;
+                        else if (fmt->is_yuv ||
+                                (req->flags & MDP_OV_PIPE_SHARE))
+                                pipe_type = MDSS_MDP_PIPE_TYPE_VIG;
+                        else
+                                pipe_type = MDSS_MDP_PIPE_TYPE_RGB;
+                        break;
+                }
 
 		pipe = mdss_mdp_pipe_alloc(mixer, pipe_type);
 
 		/* VIG pipes can also support RGB format */
-		if (!pipe && pipe_type == MDSS_MDP_PIPE_TYPE_RGB) {
+		if ((req->pipe_type == PIPE_TYPE_AUTO) && !pipe &&
+			(pipe_type == MDSS_MDP_PIPE_TYPE_RGB)) {
 			pipe_type = MDSS_MDP_PIPE_TYPE_VIG;
 			pipe = mdss_mdp_pipe_alloc(mixer, pipe_type);
 		}
@@ -1104,14 +1122,18 @@ int mdss_mdp_overlay_kickoff(struct msm_fb_data_type *mfd,
 	else
 		ret = mdss_mdp_display_commit(mdp5_data->ctl, NULL);
 
+	atomic_set(&mfd->kickoff_pending, 0);
+	wake_up_all(&mfd->kickoff_wait_q);
 	mutex_unlock(&mfd->lock);
 
 	if (IS_ERR_VALUE(ret))
 		goto commit_fail;
 
+	mutex_unlock(&mdp5_data->ov_lock);
 	mdss_mdp_overlay_update_pm(mdp5_data);
 
 	ret = mdss_mdp_display_wait4comp(mdp5_data->ctl);
+	mutex_lock(&mdp5_data->ov_lock);
 
 	if (ret == 0) {
 		mutex_lock(&mfd->lock);
@@ -1358,39 +1380,6 @@ static int mdss_mdp_overlay_queue(struct msm_fb_data_type *mfd,
 	return ret;
 }
 
-static void mdss_mdp_overlay_force_cleanup(struct msm_fb_data_type *mfd)
-{
-	struct mdss_overlay_private *mdp5_data = mfd_to_mdp5_data(mfd);
-	struct mdss_mdp_ctl *ctl = mdp5_data->ctl;
-	int ret;
-
-	pr_debug("forcing cleanup to unset dma pipes on fb%d\n", mfd->index);
-
-	/*
-	 * video mode panels require the layer to be unstaged and wait for
-	 * vsync to be able to release buffer.
-	 */
-	if (ctl && ctl->is_video_mode) {
-		ret = mdss_mdp_display_commit(ctl, NULL);
-		if (!IS_ERR_VALUE(ret))
-			mdss_mdp_display_wait4comp(ctl);
-	}
-
-	mdss_mdp_overlay_cleanup(mfd);
-}
-
-static void mdss_mdp_overlay_force_dma_cleanup(struct mdss_data_type *mdata)
-{
-	struct mdss_mdp_pipe *pipe;
-	int i;
-
-	for (i = 0; i < mdata->ndma_pipes; i++) {
-		pipe = mdata->dma_pipes + i;
-		if (atomic_read(&pipe->ref_cnt) && pipe->mfd)
-			mdss_mdp_overlay_force_cleanup(pipe->mfd);
-	}
-}
-
 static int mdss_mdp_overlay_play(struct msm_fb_data_type *mfd,
 				 struct msmfb_overlay_data *req)
 {
@@ -1415,8 +1404,6 @@ static int mdss_mdp_overlay_play(struct msm_fb_data_type *mfd,
 	}
 
 	if (req->id & MDSS_MDP_ROT_SESSION_MASK) {
-		mdss_mdp_overlay_force_dma_cleanup(mfd_to_mdata(mfd));
-
 		ret = mdss_mdp_rotator_play(mfd, req);
 	} else if (req->id == BORDERFILL_NDX) {
 		pr_debug("borderfill enable\n");
@@ -1553,6 +1540,7 @@ static void mdss_mdp_overlay_pan_display(struct msm_fb_data_type *mfd)
 		return;
 	}
 
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 	bpp = fbi->var.bits_per_pixel / 8;
 	offset = fbi->var.xoffset * bpp +
 		 fbi->var.yoffset * fbi->fix.line_length;
@@ -1617,9 +1605,11 @@ static void mdss_mdp_overlay_pan_display(struct msm_fb_data_type *mfd)
 	    (fbi->var.activate & FB_ACTIVATE_FORCE))
 		mfd->mdp.kickoff_fnc(mfd, NULL);
 
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	return;
 
 pan_display_error:
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	mutex_unlock(&mdp5_data->ov_lock);
 }
 
@@ -1788,7 +1778,7 @@ static ssize_t mdss_mdp_vsync_show_event(struct device *dev,
 	vsync_ticks = ktime_to_ns(mdp5_data->vsync_time);
 
 	pr_debug("fb%d vsync=%llu", mfd->index, vsync_ticks);
-	ret = scnprintf(buf, PAGE_SIZE, "VSYNC=%llu", vsync_ticks);
+	ret = scnprintf(buf, PAGE_SIZE, "VSYNC=%llu\n", vsync_ticks);
 
 	return ret;
 }
@@ -2245,6 +2235,10 @@ static int mdss_fb_get_hw_caps(struct msm_fb_data_type *mfd,
 		caps->features |= MDP_BWC_EN;
 	if (mdata->has_decimation)
 		caps->features |= MDP_DECIMATION_EN;
+
+	caps->max_smp_cnt = mdss_res->smp_mb_cnt;
+	caps->smp_per_pipe = mdata->smp_mb_per_pipe;
+
 	return 0;
 }
 
@@ -2335,11 +2329,17 @@ static int __handle_ioctl_overlay_prepare(struct msm_fb_data_type *mfd,
 		void __user *argp)
 {
 	struct mdp_overlay_list ovlist;
+	struct mdp_overlay *req_list[OVERLAY_MAX];
 	struct mdp_overlay *overlays;
 	int i, ret;
 
 	if (copy_from_user(&ovlist, argp, sizeof(ovlist)))
 		return -EFAULT;
+
+	if (ovlist.num_overlays >= OVERLAY_MAX) {
+		pr_err("Number of overlays exceeds max\n");
+		return -EINVAL;
+	}
 
 	overlays = kmalloc(ovlist.num_overlays * sizeof(*overlays), GFP_KERNEL);
 	if (!overlays) {
@@ -2347,8 +2347,14 @@ static int __handle_ioctl_overlay_prepare(struct msm_fb_data_type *mfd,
 		return -ENOMEM;
 	}
 
+	if (copy_from_user(req_list, ovlist.overlay_list,
+				sizeof(struct mdp_overlay*) * ovlist.num_overlays)) {
+		ret = -EFAULT;
+		goto validate_exit;
+	}
+
 	for (i = 0; i < ovlist.num_overlays; i++) {
-		if (copy_from_user(overlays + i, ovlist.overlay_list[i],
+		if (copy_from_user(overlays + i, req_list[i],
 				sizeof(struct mdp_overlay))) {
 			ret = -EFAULT;
 			goto validate_exit;
@@ -2358,7 +2364,7 @@ static int __handle_ioctl_overlay_prepare(struct msm_fb_data_type *mfd,
 	ret = __handle_overlay_prepare(mfd, &ovlist, overlays);
 	if (!IS_ERR_VALUE(ret)) {
 		for (i = 0; i < ovlist.num_overlays; i++) {
-			if (copy_to_user(ovlist.overlay_list[i], overlays + i,
+			if (copy_to_user(req_list[i], overlays + i,
 					sizeof(struct mdp_overlay))) {
 				ret = -EFAULT;
 				goto validate_exit;
@@ -2968,6 +2974,7 @@ int mdss_mdp_overlay_init(struct msm_fb_data_type *mfd)
 		goto init_fail;
 	}
 	mfd->mdp.private1 = mdp5_data;
+	mfd->wait_for_kickoff = true;
 
 	rc = mdss_mdp_overlay_fb_parse_dt(mfd);
 	if (rc)
